@@ -1,0 +1,71 @@
+{
+  "run_name": "cyl_epd_run",
+  "seed": 42,
+  "device": "cuda",
+  "dataset": {
+    "type": "cylinder",
+    "train_h5": "/workspace/graph-physics/data/cylinder/train.h5",
+    "val_h5": "/workspace/graph-physics/data/cylinder/val.h5",
+    "test_h5": "/workspace/graph-physics/data/cylinder/test.h5",
+    "train_groups": ["0","1","2","3","4","5","6","7","8","9","10","11","12","13","14","15","16","17","18","19","20","21","22","23","24","25","26","27","28","29","30","31","32","33","34","35","36","37","38","39","40","41","42","43","44","45","46","47","48","49","50","51","52","53","54","55","56","57","58","59","60","61","62","63","64","65","66","67","68","69","70","71","72","73","74","75","76","77","78","79"],
+    "val_groups": ["80","81","82","83","84","85","86","87","88","89"],
+    "test_groups": ["90","91","92","93","94","95","96","97","98","99"],
+    "frames_per_traj": 600,
+    "frame_skip": 1,
+    "batch_size": 1,
+    "num_workers": 4,
+    "khop": 1,
+    "neighbor_radius": 0.02,
+    "shuffle": true,
+    "normalization_mode": "stats",
+    "use_node_normalizer": true,
+    "use_edge_normalizer": true,
+    "normalize_velocity": true,
+    "normalize_pressure": true,
+    "normalize_position": false
+  },
+  "model": {
+    "name": "epd",
+    "node_input_size": 11,
+    "edge_input_size": 3,
+    "output_size": 2,
+    "hidden_size": 128,
+    "message_passing_num": 10,
+    "dropout_rate": 0.1,
+    "attention_heads": 0,
+    "activation": "relu",
+    "use_edge_features": true
+  },
+  "optimizer": {
+    "type": "Adam",
+    "learning_rate": 0.0005,
+    "weight_decay": 1e-06
+  },
+  "trainer": {
+    "max_epochs": 20,
+    "gpus": 1,
+    "precision": 32,
+    "gradient_clip_val": 1.0,
+    "log_every_n_steps": 50,
+    "check_val_every_n_epoch": 1,
+    "early_stop_patience": 5,
+    "deterministic": false,
+    "default_root_dir": "lightning_logs"
+  },
+  "logging": {
+    "wandb": false,
+    "wandb_project": "graph-physics",
+    "wandb_entity": "your_account",
+    "tensorboard": true,
+    "log_dir": "lightning_logs",
+    "save_predictions": true,
+    "save_images": true
+  },
+  "predict": {
+    "save_dir": "pred_out_epd",
+    "save_every_n": 1
+  },
+  "checkpoint_path": null,
+  "use_pretrained": false,
+  "inference_only": false
+}

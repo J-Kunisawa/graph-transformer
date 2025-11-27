@@ -1,0 +1,75 @@
+{
+  "model": {
+    "type": "transformer",
+    "message_passing_num": 10,
+    "node_input_size": 2,
+    "edge_input_size": 3,
+    "output_size": 2,
+    "hidden_size": 64,
+    "num_heads": 2,
+    "dropout_rate": 0.1,
+    "activation": "gelu"
+  },
+
+  "index": {
+    "feature_index_start": 0,
+    "feature_index_end": 2,
+    "output_index_start": 0,
+    "output_index_end": 2,
+    "node_type_index": 2
+  },
+
+  "dataset": {
+    "extension": "h5",
+    "h5_path": "/workspace/graph-physics/data/cylinder/train.h5",
+    "meta_path": "/workspace/graph-physics/dataset_config/cylinder_meta.json",
+    "batch_size": 4,
+    "num_workers": 8,
+    "khop": 1,
+    "targets": ["velocity"],
+    "train_groups": [ 
+      "00","01","02","03","04","05","06","07","08","09",
+      "10","11","12","13","14","15","16","17","18","19",
+      "20","21","22","23","24","25","26","27","28","29",
+      "30","31","32","33","34","35","36","37","38","39",
+      "40","41","42","43","44","45","46","47","48","49",
+      "50","51","52","53","54","55","56","57","58","59",
+      "60","61","62","63","64","65","66","67","68","69",
+      "70","71","72","73","74","75","76","77","78","79"
+    ],
+    "val_groups": ["80","81","82","83","84","85","86","87","88","89"],
+    "test_groups": ["90","91","92","93","94","95","96","97","98","99"],
+    "shuffle": true
+  },
+
+  "transformations": {
+    "preprocessing": {
+      "noise": 0.02,
+      "noise_index_start": [0],
+      "noise_index_end": [2],
+      "masking": 0
+    },
+    "world_pos_parameters": {
+      "use": false,
+      "world_pos_index_start": 0,
+      "world_pos_index_end": 3
+    }
+  },
+
+  "trainer": {
+    "accelerator": "gpu",
+    "devices": 1,
+    "precision": "16-mixed",
+    "max_epochs": 10,
+    "gradient_clip_val": 1.0,
+    "default_root_dir": "tb/runs/exp1",
+    "log_every_n_steps": 50
+  },
+
+  "optimizer": { "type": "adamw", "lr": 0.001, "weight_decay": 0.01 },
+
+  "early_stopping": { "monitor": "val_loss", "patience": 10, "mode": "min" },
+
+  "checkpoint": { "save_top_k": 1, "monitor": "val_all_rollout_rmse", "mode": "min" }
+
+}
