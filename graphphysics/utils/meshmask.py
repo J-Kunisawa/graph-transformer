@@ -2,85 +2,80 @@ import torch
 import torch.nn as nn
 from torch_geometric.data import Data
 from torch_geometric.utils.num_nodes import maybe_num_nodes
-from typing import Tuple, Optional
 
-
-def _device_of_tensor(t: Optional[torch.Tensor]) -> torch.device:
-    return t.device if isinstance(t, torch.Tensor) else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# 演算を実行するデバイス（GPU/CPU）の自動決定
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def filter_edges(
-    edge_index: torch.Tensor, node_index: torch.Tensor, edge_attr: Optional[torch.Tensor] = None
-) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
+    edge_index: torch.Tensor, node_index: torch.Tensor, edge_attr: torch.Tensor = None
+):
     """
-    node_index に含まれるノードのみを残すよう edge_index と edge_attr をフィルタする。
-    戻り値: (filtered_edge_index, filtered_edge_attr or None, boolean_mask_for_edges)
-    """
-    if edge_index is None:
-        raise ValueError("edge_index must be provided")
+    指定された生存ノードID（node_index）に基づいてグラフのエッジをフィルタリングし、
+    生存したコンパクトなノード番号に合わせてエッジインデックスを 0 から振り直す（再インデックス）。
 
+    パラメータ:
+        edge_index (Tensor): 元のグラフのエッジトポロジー [2, NumEdges]
+        node_index (Tensor): マスキングを免れて生存（選択）させるノードのID群
+        edge_attr (Tensor, optional): 各エッジに紐付く幾何特徴量
+    """
+    # グラフの総ノード数を動的に取得
     num_nodes = maybe_num_nodes(edge_index, None)
-    device = _device_of_tensor(edge_index)
-
     node_index = node_index.to(device)
-    cluster_index = torch.arange(node_index.size(0), device=device)
+    
+    # 切り出された新しい部分グラフ内での連番インデックス（0, 1, 2, ...）を作成
+    cluster_index = torch.arange(node_index.size(0), device=node_index.device)
 
-    # -1 で初期化されたマッピングテーブルを作る
-    map_table = node_index.new_full((num_nodes,), -1)
-    map_table[node_index] = cluster_index
+    # ループ無しの超高速再インデックス用ルックアップテーブル（マスク配列）の構築
+    # 全ノード分の配列を一度 -1 で満たし、生存ノードの場所にだけ新しい連番インデックスを代入
+    mask = node_index.new_full((num_nodes,), -1).to(device)
+    mask[node_index] = cluster_index
 
-    senders = edge_index[0].to(device)
-    receivers = edge_index[1].to(device)
+    # 全エッジの始点（senders）と終点（receivers）を取得
+    senders, receivers = edge_index[0], edge_index[1]
+    
+    # ルックアップテーブルを参照し、古いノードIDを新しい連番IDへ一括置換
+    senders, receivers = mask[senders], mask[receivers]
+    
+    # 始点と終点の双方が生存（インデックスが0以上）しているエッジのみを True とするマスクを作成
+    mask = (senders >= 0) & (receivers >= 0)
+    
+    # 生存したエッジだけを切り出し
+    senders, receivers = senders[mask], receivers[mask]
 
-    mapped_senders = map_table[senders]
-    mapped_receivers = map_table[receivers]
+    # エッジ特徴量（距離など）が存在する場合は、同様にフィルタリング
+    if edge_attr is not None:
+        edge_attr = edge_attr[mask]
 
-    edge_mask = (mapped_senders >= 0) & (mapped_receivers >= 0)
-    mapped_senders = mapped_senders[edge_mask]
-    mapped_receivers = mapped_receivers[edge_mask]
-
-    filtered_ei = torch.stack([mapped_senders, mapped_receivers], dim=0)
-    filtered_eattr = edge_attr.to(device)[edge_mask] if edge_attr is not None else None
-
-    return filtered_ei, filtered_eattr, edge_mask
+    # 再インデックスされた新しいエッジ構造、エッジ特徴量、および生存エッジマスクを返す
+    return torch.stack([senders, receivers], dim=0), edge_attr, mask
 
 
 def build_masked_graph(
-    graph: Data,
+    masked_graph: Data,
     selected_indexes: torch.Tensor,
-) -> Tuple[Data, torch.Tensor]:
+):
     """
-    入力グラフの選択ノードのみを残した複製グラフを返す。
-    - 元のグラフは変更しない。
-    - 戻り値: (masked_graph, edges_boolean_mask)
+    Masked Autoencoder（MAE）タスクの順伝播用関数。
+    入力されたメッシュグラフから、指定した生存インデックス（selected_indexes）以外のノードを隠蔽し、
+    ノード特徴量、座標、トポロジーがすべてコンパクトにクリップされた『部分グラフ』を生成する。
     """
-    if not isinstance(selected_indexes, torch.Tensor):
-        selected_indexes = torch.tensor(selected_indexes, dtype=torch.long)
+    # 1. filter_edges を呼び出し、トポロジーエッジの切り出しと再インデックス化を実行
+    masked_e_index, masked_e_attr, edges_mask = filter_edges(
+        masked_graph.edge_index, selected_indexes, masked_graph.edge_attr
+    )
 
-    # clone してインプレース変更を避ける
-    mg = graph.clone()
+    # 2. グラフオブジェクトの各属性を選択された生存領域だけに破壊的更新（上書き）
+    masked_graph.edge_index = masked_e_index
+    masked_graph.x = masked_graph.x[selected_indexes] # 生存ノードの特徴量のみをキープ
+    
+    if masked_graph.pos is not None:
+        masked_graph.pos = masked_graph.pos[selected_indexes] # 生存ノードの座標のみをキープ
 
-    if getattr(graph, "edge_index", None) is None:
-        # no edges: only select nodes
-        mg.x = mg.x[selected_indexes]
-        if getattr(mg, "pos", None) is not None:
-            mg.pos = mg.pos[selected_indexes]
-        mg.edge_index = None
-        mg.edge_attr = None
-        return mg, torch.tensor([], dtype=torch.bool)
+    if masked_e_attr is not None:
+        masked_graph.edge_attr = masked_e_attr
 
-    filtered_ei, filtered_eattr, edges_mask = filter_edges(graph.edge_index, selected_indexes, getattr(graph, "edge_attr", None))
-
-    mg.x = mg.x[selected_indexes]
-    if getattr(mg, "pos", None) is not None:
-        mg.pos = mg.pos[selected_indexes]
-    mg.edge_index = filtered_ei
-    if filtered_eattr is not None:
-        mg.edge_attr = filtered_eattr
-    else:
-        mg.edge_attr = None
-
-    return mg, edges_mask
+    return masked_graph, edges_mask
 
 
 def reconstruct_graph(
@@ -89,62 +84,38 @@ def reconstruct_graph(
     selected_indexes: torch.Tensor,
     node_mask_token: torch.nn.Parameter,
     edges_mask: torch.Tensor,
-    edge_encoder: Optional[nn.Module] = None,
-    edge_mask_token: Optional[torch.nn.Parameter] = None,
+    edge_encoder: nn.Module = None,
+    edge_mask_token: torch.nn.Parameter = None,
 ) -> Data:
     """
-    マスクされた潜在グラフの出力を使って元グラフを再構築する。
-    - masked ノードは latent_masked_graph.x の値を使い、マスクされたノードは node_mask_token で埋める。
-    - edge_attr がある場合は edge_encoder を通し edge_mask_token で埋め、unmasked edge は latent_masked_graph.edge_attr で置換する。
+    Masked Decoder（復元デコーダ）の直前で呼び出されるグラフ再構築関数。
+    
+    部分グラフから計算された潜在特徴量（x）を、元々の広大なメッシュの正しい配置（selected_indexes）へ書き戻し、
+    あらかじめ隠蔽（マスク）されていた領域には、学習可能な共有パラメータである『 [MASK] トークン 』を敷き詰めて
+    元の完全なメッシュ構造へと復元統合する。
     """
-    device = _device_of_tensor(graph.x if hasattr(graph, "x") else None)
+    # 元のメッシュのノード数（n）と潜在次元数（f）を取得
+    n, f = graph.x.shape
+    
+    # 1. 全ノードを一度、学習可能な [MASK] トークンベクトルのコピーで初期充填する
+    features = torch.zeros(n, f).to(device)
+    features += node_mask_token.expand(n, -1)
+    
+    # 2. マスクを免れていた領域（selected_indexes）に対して、部分グラフが高度に計算した潜在特徴量を上書きマッピング
+    features[selected_indexes] = latent_masked_graph.x
 
-    n_nodes, feat_dim = graph.x.shape
-    # prepare base features filled with node mask token
-    node_token = node_mask_token.to(device)
-    if node_token.numel() == 1:
-        node_token = node_token.expand(feat_dim)
-    node_token = node_token.reshape(1, -1)
-    if node_token.size(1) != feat_dim:
-        raise ValueError("node_mask_token dimension does not match graph node feature dim")
+    # 元のグラフのトポロジーをクローンし、今パッキングした特徴量を割り当て
+    latent_graph = graph.clone()
+    latent_graph.x = features
 
-    features = node_token.expand(n_nodes, -1).clone()
+    # エッジ特徴量に対しても、全く同様の [MASK] トークン埋め込みと部分グラフからの復元を実行
+    if graph.edge_attr is not None:
+        n_edges, _ = graph.edge_attr.shape
+        # 生のエッジ特徴量をエンコーダで潜在空間へ写像
+        latent_graph.edge_attr = edge_encoder(latent_graph.edge_attr)
+        # 一度すべてをエッジ用の [MASK] トークンで満たす
+        latent_graph.edge_attr += edge_mask_token.expand(n_edges, -1)
+        # 生存していたエッジ領域にだけ、部分グラフ側で計算していたエッジ特徴量を復元マッピング
+        latent_graph.edge_attr[edges_mask] = latent_masked_graph.edge_attr
 
-    # place latent features for selected indexes
-    sel = selected_indexes.to(device)
-    features[sel] = latent_masked_graph.x.to(device)
-
-    out_graph = graph.clone()
-    out_graph.x = features
-
-    # handle edges
-    if getattr(graph, "edge_attr", None) is not None:
-        orig_eattr = graph.edge_attr.to(device)
-        n_edges = orig_eattr.size(0)
-
-        # encode original edges if encoder provided
-        if edge_encoder is not None:
-            encoded = edge_encoder(orig_eattr)
-        else:
-            encoded = orig_eattr
-
-        # prepare mask token for edges
-        if edge_mask_token is None:
-            edge_token = torch.zeros((1, encoded.size(1)), device=device, dtype=encoded.dtype)
-        else:
-            edge_token = edge_mask_token.to(device).reshape(1, -1)
-            if edge_token.size(1) != encoded.size(1):
-                raise ValueError("edge_mask_token dim mismatch with encoded edge feature dim")
-
-        encoded = encoded.clone()
-        encoded[:] = edge_token.expand(n_edges, -1)
-
-        # replace unmasked edges with latent values (edges_mask is boolean over original edges)
-        if latent_masked_graph.edge_attr is not None and edges_mask.numel() == n_edges:
-            encoded[edges_mask.to(device)] = latent_masked_graph.edge_attr.to(device)
-
-        out_graph.edge_attr = encoded
-    else:
-        out_graph.edge_attr = None
-
-    return out_graph
+    return latent_graph

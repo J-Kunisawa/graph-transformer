@@ -1,5 +1,5 @@
 from collections import OrderedDict
-from typing import Callable, Optional, Tuple, Union, Dict
+from typing import Callable, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -14,22 +14,18 @@ from graphphysics.utils.hierarchical import (
     read_h5_metadata,
 )
 
+# HDF5形式のファイルを読み込むためのライブラリ。インストールされていない場合はエラーを出す
 try:
     import h5py
 except ImportError as exc:
-    raise RuntimeError("h5py is required to use H5Dataset") from exc
+    raise RuntimeError("H5Datasetを使用するにはh5pyが必要です") from exc
 
 
 class H5Dataset(BaseDataset):
     """
-    HDF5 ベースのデータセット。
-
-    特徴:
-    - worker ごとに h5py.File ハンドルを保持（get_worker_info を利用）
-    - 軌跡・フレームごとの変換結果をキャッシュして再計算を避ける
-    - add_edge_features / khop / masking など BaseDataset の設定を尊重
+    HDF5 (.h5) 形式の物理シミュレーションデータを読み込み、PyTorch Geometricのグラフデータ(Data)
+    として提供するデータセットクラス。BaseDatasetを継承し、インデックス管理や前処理を引き継ぐ。
     """
-
     def __init__(
         self,
         h5_path: str,
@@ -41,11 +37,13 @@ class H5Dataset(BaseDataset):
         new_edges_ratio: float = 0,
         add_edge_features: bool = True,
         use_previous_data: bool = False,
-        switch_to_val: bool = False,
         world_pos_parameters: Optional[dict] = None,
         cache_size: int = 8,
+        use_partitioning: bool = False,
+        num_partitions: Optional[int] = None,
+        max_nodes_per_partition: Optional[int] = None,
     ):
-        # BaseDataset は meta_path を読み込み self.meta を初期化する
+        # 親クラス(BaseDataset)の初期化を呼び出し、共通設定やインデックス管理機能をセットアップ
         super().__init__(
             meta_path=meta_path,
             targets=targets,
@@ -56,80 +54,103 @@ class H5Dataset(BaseDataset):
             add_edge_features=add_edge_features,
             use_previous_data=use_previous_data,
             world_pos_parameters=world_pos_parameters,
+            use_partitioning=use_partitioning,
+            num_partitions=num_partitions,
+            max_nodes_per_partition=max_nodes_per_partition,
         )
 
         self.type = "h5"
-
-        # train <-> test 切替（validation 用スイッチ）
-        if switch_to_val:
-            h5_path = h5_path.replace("train", "test")
-
         self.h5_path = h5_path
         self.meta_path = meta_path
-        self.cache_size = int(cache_size)
+        
+        # メモリ（RAM）に保持する軌跡やグラフの最大数（ディスクI/Oを減らし高速化するため）
+        self.cache_size = cache_size
 
-        # metadata と trajectory index を読み取り（より完全な meta を上書き）
-        (
-            self.datasets_index,
-            self._size_dataset,
-            file_meta,
-        ) = read_h5_metadata(dataset_path=h5_path, meta_path=meta_path)
-        # read_h5_metadata が返す meta を採用（BaseDataset の meta と差分があればこちらが正）
-        if file_meta is not None:
-            self.meta = file_meta
-
-        # timestep (dt) のフォールバックと警告処理
-        self.dt = float(self.meta.get("dt", 1.0))
+        # シミュレーションの時間刻み幅（dt）を取得
+        self.dt = self.meta["dt"]
         if self.dt == 0:
-            self.dt = 1.0
+            self.dt = 1
             logger.warning(
-                "The dataset has dt == 0 in meta; falling back to dt=1.0 to allow XDMF export."
+                "データセットのタイムステップ(dt)が0に設定されています。xdmf形式で保存できるよう dt=1 にフォールバックします。"
             )
 
-        # 内部キャッシュ / ハンドル
-        self._file_handles: Dict[str, h5py.File] = {}
-        self._trajectory_cache: "OrderedDict[str, dict]" = OrderedDict()
-        self._frame_cache: "OrderedDict[Tuple[str, int], Tuple[Data, Optional[torch.Tensor]]]" = OrderedDict()
+        # HDF5ファイルとメタデータから、データセット内の全軌跡（シミュレーションケース）の情報を取得
+        (
+            self.datasets_index, # 軌跡の名前（キー）のリスト
+            self._size_dataset,  # 軌跡の総数
+            self.meta,           # 補完されたメタデータ
+        ) = read_h5_metadata(dataset_path=h5_path, meta_path=meta_path)
 
-    @property
-    def size_dataset(self) -> int:
-        """データセット中の軌跡数を返す。"""
-        return int(self._size_dataset)
+        # PyTorchのDataLoaderが複数ワーカー(num_workers > 0)で動く際、
+        # 各プロセスが独自のHDF5ファイルハンドルを持てるようにするための辞書
+        self._file_handles: dict[str, h5py.File] = {}
+        
+        # LRU（Least Recently Used）キャッシュとして機能するOrderedDict。
+        # 古いデータから順に破棄してメモリ枯渇を防ぐ。
+        self._trajectory_cache: OrderedDict[str, dict] = OrderedDict()
+        # 確率的な前処理結果ではなく、生グラフだけをキャッシュする。
+        self._frame_cache: OrderedDict[tuple[str, int], Data] = OrderedDict()
+        
+        # BaseDatasetのインデックスマップ構築処理を実行
+        self._build_index_map()
 
-    def _close_file_handles(self) -> None:
-        """全ワーカーの h5py.File ハンドルを安全にクローズする。"""
-        for handle in list(self._file_handles.values()):
-            try:
-                if handle is not None:
+    def _build_index_map(self):
+            """
+            HDF5内の各軌跡（シミュレーション動画）のノード数を取得し、
+            親クラスの `_add_traj_to_index_map` を使ってグローバルインデックスを構築する。
+            """
+            handle = self._get_file_handle()
+            for traj_index, traj_name in enumerate(self.datasets_index):
+                # メッシュのノード数を取得
+                num_nodes = handle[traj_name]["mesh_pos"].shape[-2]
+                self._add_traj_to_index_map(traj_index, num_nodes)
+
+            # 初期化が終わったこの段階で、一旦すべてのファイルハンドルを綺麗に閉じてリセットする
+            self._close_file_handles()
+            
+    def _close_file_handles(self):
+        """開いている全てのHDF5ファイルハンドルを安全に閉じる"""
+        for handle in self._file_handles.values():
+            if handle is not None:
+                try:
                     handle.close()
-            except Exception:
-                # 破棄時の例外は無視して続行
-                pass
+                except Exception:
+                    pass
         self._file_handles.clear()
 
     def _get_file_handle(self) -> h5py.File:
         """
-        ワーカーごとの h5py.File を返す。worker ごとに独立したハンドルを持つことで
-        マルチプロセス読み出し時の競合を避ける。
+        現在のプロセス（ワーカー）に対応するHDF5ファイルハンドルを取得する。
+        ※マルチプロセス環境でHDF5を安全に読み込むための必須処理。
         """
         worker_info = get_worker_info()
         worker_id = str(worker_info.id) if worker_info is not None else "main"
         handle = self._file_handles.get(worker_id)
+        
+        # まだこのワーカー用のハンドルが開かれていなければ、Read-Only("r")で開く
         if handle is None:
             handle = h5py.File(self.h5_path, "r")
             self._file_handles[worker_id] = handle
         return handle
 
     def _get_trajectory(self, traj_number: str) -> dict:
-        """traj_number に対応する軌跡データをキャッシュ付きで取得する。"""
+        """
+        指定された軌跡（シミュレーションケース全体）のデータをキャッシュから取得するか、
+        HDF5から読み込んでキャッシュに保存する。
+        """
         cached = self._trajectory_cache.get(traj_number)
         if cached is not None:
-            # LRU 効果のため末尾に移動
+            # キャッシュヒットした場合は、最新の使用履歴として末尾に移動（LRU管理）
             self._trajectory_cache.move_to_end(traj_number)
             return cached
 
-        fh = self._get_file_handle()
-        trajectory = get_traj_as_meshes(file_handle=fh, traj_number=traj_number, meta=self.meta)
+        # キャッシュになければHDF5から読み込む
+        file_handle = self._get_file_handle()
+        trajectory = get_traj_as_meshes(
+            file_handle=file_handle, traj_number=traj_number, meta=self.meta
+        )
+        
+        # 読み込んだデータをキャッシュに保存し、上限を超えたら一番古いものを削除
         self._trajectory_cache[traj_number] = trajectory
         if len(self._trajectory_cache) > self.cache_size:
             self._trajectory_cache.popitem(last=False)
@@ -139,43 +160,51 @@ class H5Dataset(BaseDataset):
         self,
         key: tuple[str, int],
         graph: Data,
-        selected_indices: Optional[torch.Tensor],
     ) -> None:
-        """(graph, selected_indices) をフレームキャッシュに保存する。"""
-        self._frame_cache[key] = (graph, selected_indices)
+        """確定的な前処理前のグラフをメモリにキャッシュする。"""
+        self._frame_cache[key] = graph
         self._frame_cache.move_to_end(key)
+        
+        # グラフキャッシュは軌跡キャッシュの2倍の容量を持たせる設定
         if len(self._frame_cache) > self.cache_size * 2:
             self._frame_cache.popitem(last=False)
+        return None
 
     def _build_node_features(self, traj: dict, frame: int) -> torch.Tensor:
         """
-        軌跡 dict からノード特徴行列を作る（time 列を末尾に追加）。
-        戻り値は torch.float32 のテンソル。
+        指定されたフレームの物理量（速度や圧力など）を辞書から取り出し、
+        1つの特徴量テンソル（Node Features Matrix）として結合する。
         """
-        time = frame * float(self.meta.get("dt", 1.0))
+        # シミュレーション上の現在時刻を計算
+        time = frame * self.meta.get("dt", 1)
 
+        # 座標やセル構成、ノードタイプ以外の、動的な物理量（ポイントデータ）を抽出
         point_data = {
             key: (traj[key][frame] if traj[key].ndim > 1 else traj[key])
             for key in traj.keys()
-            if key not in ("mesh_pos", "cells", "node_type")
+            if key not in ["mesh_pos", "cells", "node_type"]
         }
-        # node_type は通常 shape=(N,) もしくは (1,N) で保存されるので整形
+        # ノードタイプ（境界条件など）は時間変化しないため最初のフレームのものを取得
         point_data["node_type"] = traj["node_type"][0]
 
         arrays = []
-        for arr in point_data.values():
-            a = arr
-            if a.ndim == 1:
-                a = a[:, None]
-            arrays.append(a.astype(np.float32))
+        # 各フィールドをFloat32のNumPy配列に変換し、リストにまとめる
+        for data in point_data.values():
+            arr = data
+            if arr.ndim == 1:
+                arr = arr[:, None] # 1次元配列なら2次元に拡張 (N,) -> (N, 1)
+            arrays.append(arr.astype(np.float32))
 
+        # 特徴量を横方向（チャンネル方向）に結合
         if arrays:
             node_features = np.concatenate(arrays, axis=1)
         else:
             node_features = np.zeros((traj["mesh_pos"].shape[-2], 0), dtype=np.float32)
 
+        # 特徴量の最後に「時刻(time)」の列を追加する
         time_column = np.full((node_features.shape[0], 1), time, dtype=np.float32)
         node_features = np.concatenate([node_features, time_column], axis=1)
+
         return torch.from_numpy(node_features)
 
     def _get_processed_graph(
@@ -185,127 +214,91 @@ class H5Dataset(BaseDataset):
         traj: Optional[dict] = None,
     ) -> Tuple[Data, Optional[torch.Tensor]]:
         """
-        指定 traj_index, frame に対応する加工済みグラフを返す（キャッシュ使用）。
-        返り値は (graph, selected_indices) — masking がなければ selected_indices は None。
+        指定フレームのグラフを取得し、ノイズ付加やK-hopなどの前処理を適用する。
+        生グラフだけをキャッシュし、確率的な前処理はアクセスごとに再実行する。
         """
         traj_number = self.datasets_index[traj_index]
         cache_key = (traj_number, frame)
 
+        # キャッシュの確認
         cached = self._frame_cache.get(cache_key)
         if cached is not None:
             self._frame_cache.move_to_end(cache_key)
-            graph, selected_indices = cached
+            base_graph = cached
         else:
+            # キャッシュがない場合、ゼロからグラフを構築する
             if traj is None:
                 traj = self._get_trajectory(traj_number)
 
-            graph = get_frame_as_graph(
+            # 辞書データからPyTorch GeometricのDataオブジェクト(グラフ)を作成
+            # (ここで x, y, pos, edge_index が構築される)
+            base_graph = get_frame_as_graph(
                 traj=traj,
                 frame=frame,
                 meta=self.meta,
                 targets=self.targets,
-                frame_target=frame + 1,
+                frame_target=frame + 1, # 次のフレームの変化量がターゲット(教師ラベル)
             )
 
-            # preprocessing / k-hop / edge features / random edges / masking の順で適用
-            graph = self._apply_preprocessing(graph)
-            graph = self._apply_k_hop(graph, traj_index)
-            graph = self._may_remove_edges_attr(graph)
-            graph = self._add_random_edges(graph)
-            selected_indices = self._get_masked_indexes(graph)
+            # 前処理（build_features等）で過去データが必要な場合に備え、内部ストレージにセット
+            if self.use_previous_data:
+                previous_features = self._build_node_features(traj, frame - 1)
+                base_graph.previous_data = previous_features
 
-            # ensure long dtype for edge_index if present
-            if getattr(graph, "edge_index", None) is not None:
-                graph.edge_index = graph.edge_index.long()
+            self._cache_graph(cache_key, base_graph)
 
-            self._cache_graph(cache_key, graph, selected_indices)
+        # キャッシュ本体を確率的な前処理で破壊しないよう、先にクローンする。
+        graph = base_graph.clone()
+        graph = self._apply_preprocessing(graph)
+        graph = self._apply_k_hop(graph, traj_index)
+        graph = self._may_remove_edges_attr(graph)
+        graph = self._add_random_edges(graph)
+        selected_indices = self._get_masked_indexes(graph)
 
-        # 呼び出し側が安全に変更できるようにクローンして返す
-        graph_out = graph.clone()
-        selected_out = selected_indices.clone() if selected_indices is not None else None
-        return graph_out, selected_out
+        graph.edge_index = (
+            graph.edge_index.long() if graph.edge_index is not None else None
+        )
+        return graph, selected_indices
 
     def __getitem__(self, index: int) -> Union[Data, Tuple[Data, torch.Tensor]]:
         """
-        Global index を受け取り、対応するフレームの graph（と optional な selected_indices）を返す。
-        use_previous_data=True の場合は previous_data を graph に付与する。
+        DataLoaderから呼ばれるメインのデータ取得メソッド。
+        1次元のインデックスから対応する軌跡とフレームを逆算し、グラフを返す。
+
+        パラメータ:
+            index (int): データセット内のグローバルインデックス
+
+        戻り値:
+            Union[Data, Tuple[Data, torch.Tensor]]: 指定されたフレームのグラフデータ。
+            マスキングが適用されている場合は、選択されたインデックスも一緒に返す。
         """
-        traj_index, frame = self.get_traj_frame(index=index)
+        # 親クラスのメソッドでインデックスを分解
+        traj_index, frame, subgraph_idx = self._get_indices(index)
         traj_number = self.datasets_index[traj_index]
+        
+        # 軌跡データ（辞書）をロードまたはキャッシュから取得
         traj = self._get_trajectory(traj_number)
 
-        # If previous-data is requested, we must ensure that the
-        # preprocessing pipeline (which may depend on graph.previous_data)
-        # runs with previous data available. The original implementation
-        # applied preprocessing first and attached previous_data afterwards,
-        # which prevented extra_node_features (e.g. build_features) from
-        # seeing the previous frame. To fix this, when use_previous_data=True
-        # we build a raw previous-data dict, attach it to the raw graph, and
-        # then run the preprocessing pipeline so that the resulting
-        # `graph.x` and `graph.previous_data` have matching column layout.
-
-        if not (self.use_previous_data and frame > 0):
-            # fast path: no previous-data needed, reuse existing helper
-            graph, selected_indices = self._get_processed_graph(traj_index=traj_index, frame=frame, traj=traj)
-        else:
-            # Build raw graph (unprocessed) for current frame
-            raw_graph = get_frame_as_graph(
-                traj=traj,
-                frame=frame,
-                meta=self.meta,
-                targets=self.targets,
-                frame_target=frame + 1,
-            )
-
-            # Construct a previous-data mapping using the same keys the
-            # raw trajectory provides. This is a lightweight dict of numpy
-            # arrays that extra_node_features (like aneurysm.build_features)
-            # can inspect. We include all point-wise arrays except mesh/cells
-            prev_dict: Dict[str, np.ndarray] = {}
-            try:
-                for k in traj.keys():
-                    if k in ("mesh_pos", "cells"):
-                        continue
-                    # select previous frame slice if available
-                    try:
-                        val = traj[k][frame - 1]
-                        prev_dict[k] = val
-                    except Exception:
-                        # skip keys we cannot slice
-                        continue
-            except Exception:
-                prev_dict = {}
-
-            # Attach previous_data (dict of numpy arrays) so preprocessing
-            # functions can consume it when building features.
-            raw_graph.previous_data = prev_dict
-
-            # Now apply the standard processing pipeline (preprocessing,
-            # k-hop, edge features, random edges, masking). This will
-            # consult raw_graph.previous_data where appropriate.
-            graph = self._apply_preprocessing(raw_graph)
-            graph = self._apply_k_hop(graph, traj_index)
-            graph = self._may_remove_edges_attr(graph)
-            graph = self._add_random_edges(graph)
-            selected_indices = self._get_masked_indexes(graph)
-
-            # ensure long dtype for edge_index if present
-            if getattr(graph, "edge_index", None) is not None:
-                graph.edge_index = graph.edge_index.long()
-
-            # Cache the processed graph for future calls
-            cache_key = (traj_number, frame)
-            self._cache_graph(cache_key, graph, selected_indices)
+        # 前処理済みのグラフデータを取得
+        graph, selected_indices = self._get_processed_graph(
+            traj_index=traj_index, frame=frame, traj=traj
+        )
 
         graph.traj_index = traj_index
 
+        # TODO: マスキング(selected_indices)とパーティショニングの併用は現在未対応
+        # メッシュ分割（メモリ節約用）が有効な場合、指定されたサブ領域のグラフを切り出す
+        if self.use_partitioning:
+            graph = self._get_partition(graph, traj_index, subgraph_idx)
+
+        # 戻り値のフォーマット
         if selected_indices is not None:
             return graph, selected_indices
-        return graph
+        else:
+            return graph
 
     def __del__(self):
-        """オブジェクト破棄時にファイルハンドルを閉じる（安全に実行）。"""
-        try:
-            self._close_file_handles()
-        except Exception:
-            pass
+        """
+        オブジェクトが破棄される際、HDF5ファイルが開きっぱなしにならないよう確実に閉じる。
+        """
+        self._close_file_handles()

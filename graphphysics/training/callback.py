@@ -1,13 +1,10 @@
 import os
-from typing import List, Optional, Tuple
+from typing import List
 
+import lightning.pytorch as pl
 import numpy as np
-try:
-    import pyvista as pv
-except Exception:
-    pv = None
+import pyvista as pv
 import torch
-from loguru import logger
 from lightning.pytorch.callbacks import Callback
 from torch_geometric.data import Data, Dataset
 
@@ -15,216 +12,195 @@ import wandb
 from graphphysics.training.lightning_module import build_mask
 from graphphysics.utils.pyvista_mesh import convert_to_pyvista_mesh
 
-# Headless safety defaults
-os.environ.setdefault("PYVISTA_OFF_SCREEN", "1")
-if "DISPLAY" in os.environ:
-    del os.environ["DISPLAY"]
-
-
-def _is_headless() -> bool:
-    """環境変数で明示的にオフになっているか DISPLAY が無ければ headless とみなす。"""
-    if os.environ.get("DISABLE_VIZ", "0") == "1":
-        return True
-    if os.environ.get("PYVISTA_OFF_SCREEN", "0") == "1":
-        return True
-    if not os.environ.get("DISPLAY"):
-        return True
-    return False
-
-
-def _to_uint8_image(img: np.ndarray) -> np.ndarray:
-    """Ensure an image is uint8 HxWxC."""
-    if img is None:
-        return None
-    arr = np.asarray(img)
-    if arr.dtype != np.uint8:
-        # normalize to 0-255 if float in 0..1 or scale linearly otherwise
-        if np.issubdtype(arr.dtype, np.floating):
-            arr = (np.clip(arr, 0.0, 1.0) * 255.0).astype(np.uint8)
-        else:
-            arr = arr.astype(np.uint8)
-    return arr
-
 
 class LogPyVistaPredictionsCallback(Callback):
     """
-    Validation epoch end で PyVista 図を作り wandb に送るコールバック。
-
-    - dataset: DataLoader ではなく Dataset（index 指定でサンプル取得するため）
-    - indices: ログ対象のグローバルインデックス一覧
-    - output_dir: 一時的に画像を保存したい場合のディレクトリ
+    PyTorch Lightning コールバッククラス。
+    各検証（Validation）エポックの終了時に、モデルの予測した物理場（速度場コンター等）を
+    PyVistaによる3Dレンダリングを用いて画像および動画化し、Weights & Biases (WandB) へ自動送信する。
     """
 
-    def __init__(self, dataset: Dataset, indices: List[int], output_dir: str = "predictions"):
+    def __init__(
+        self, dataset: Dataset, indices: List[int], output_dir: str = "predictions"
+    ):
+        """
+        パラメータ:
+            dataset (Dataset): 検証データを取得するためのPyGデータセット。
+            indices (List[int]): 静止画ログ、および動画化するフレーム範囲を指定するためのインデックスリスト。
+            output_dir (str): 生成された画像等の一時保存先ディレクトリ。デフォルトは 'predictions'。
+        """
         super().__init__()
         self.dataset = dataset
-        self.indices = list(indices)
+        self.indices = indices
         self.output_dir = output_dir
 
-    def on_validation_epoch_end(self, trainer, pl_module) -> None:
-        # Headless 環境では何もしない（呼び出しが高頻度なので早期リターン）
-        if _is_headless():
-            logger.debug("Headless environment detected: skipping PyVista logging.")
-            return
+    def _forward_with_autocast_if_needed(
+        self, model: pl.LightningModule, graph: Data
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        モデルの重みが半精度（Float16 / BFloat16）で訓練されている場合、
+        コールバック側の前方向計算でも自動混合精度（CUDA Autocast）のコンテキストを安全に展開して推論を行う。
+        """
+        first_param = next(model.parameters(), None)
+        use_cuda_autocast = (
+            graph.x.is_cuda
+            and first_param is not None
+            and first_param.dtype in (torch.float16, torch.bfloat16)
+        )
+        if use_cuda_autocast:
+            with torch.autocast(device_type="cuda", dtype=first_param.dtype):
+                return model(graph)
+        return model(graph)
 
+    def on_validation_epoch_end(
+        self, trainer: pl.Trainer, pl_module: pl.LightningModule
+    ):
+        """
+        検証エポックの終了時にPyTorch Lightningシステムから自動的に呼び出されるメインループ。
+        """
         os.makedirs(self.output_dir, exist_ok=True)
-        device = pl_module.device if hasattr(pl_module, "device") else torch.device("cpu")
+        model = pl_module
+        device = model.device
 
         images = []
         ground_truth = []
 
-        try:
-            with torch.no_grad():
-                for idx in self.indices:
-                    sample = self.dataset[idx]
-                    # dataset が (graph, mask) を返す可能性に対応
-                    if isinstance(sample, tuple) and len(sample) >= 1:
-                        graph = sample[0]
-                    else:
-                        graph = sample
+        # --- フェーズ 1: 指定された特定サンプルの「静止画像」の生成・ログ ---
+        with torch.no_grad():
+            for idx in self.indices:
+                # 指定インデックスの生グラフを抽出し、GPUなどのデバイスへ転送
+                graph = self.dataset[idx].to(device)
+                
+                # シミュレータに入力して予測を実行（内部で正規化や変化量の加算が処理される）
+                _, _, predicted_outputs = self._forward_with_autocast_if_needed(
+                    model, graph
+                )
 
-                    graph = graph.to(device)
+                # グラフのノード特徴量を、モデルが算出した「実スケールの予測物理量」に上書き
+                graph.x = predicted_outputs
+                
+                feature_names = model.param.get("dataset", {}).get("feature_names", None)
 
-                    # model(graph) -> (network_out, target_delta_norm, outputs)
-                    try:
-                        _, _, predicted_outputs = pl_module(graph)
-                    except Exception:
-                        # 互換性保険: pl_module.predict_step / forward の違いに対応
-                        predicted_outputs = None
-                        try:
-                            forward_ret = pl_module.forward(graph)
-                            if isinstance(forward_ret, tuple) and len(forward_ret) >= 3:
-                                predicted_outputs = forward_ret[2]
-                            elif isinstance(forward_ret, torch.Tensor):
-                                predicted_outputs = forward_ret
-                        except Exception as e:
-                            logger.error(f"Failed to obtain prediction for idx={idx}: {e}")
+                # PyVista形式の3Dメッシュデータオブジェクトへ変換
+                predicted_mesh = self._convert_to_pyvista_mesh(graph, feature_names)
 
-                    if predicted_outputs is None:
-                        logger.warning(f"No prediction produced for idx={idx}; skipping visualization for this sample.")
-                        continue
+                # オフスクリーン（画面非表示）で3Dレンダリングを行い、スクリーンショット画像を取得
+                img = self._generate_pyvista_image(predicted_mesh, feature_names)
+                images.append(
+                    wandb.Image(img, caption=f"Prediction: Sample Index: {idx}")
+                )
 
-                    # set graph.x to predictions for visualization
-                    graph_vis = graph.clone()
-                    graph_vis.x = predicted_outputs
+                # --- 全く同じ処理を正解データ（Ground Truth）に対しても実行 ---
+                graph.x = graph.y # 特徴量を次の時刻の正解物理量に書き換え
+                ground_truth_mesh = self._convert_to_pyvista_mesh(graph, feature_names)
 
-                    mesh_pred = convert_to_pyvista_mesh(graph_vis)
-                    img = self._generate_pyvista_image(mesh_pred)
-                    img_arr = _to_uint8_image(img)
-                    if img_arr is not None:
-                        images.append(wandb.Image(img_arr, caption=f"Prediction idx={idx}"))
+                img = self._generate_pyvista_image(ground_truth_mesh, feature_names)
+                ground_truth.append(
+                    wandb.Image(img, caption=f"Ground Truth: Sample Index: {idx}"),
+                )
 
-                    # ground truth
-                    gt_graph = graph.clone()
-                    if hasattr(gt_graph, "y") and gt_graph.y is not None:
-                        gt_graph.x = gt_graph.y
-                        mesh_gt = convert_to_pyvista_mesh(gt_graph)
-                        img = self._generate_pyvista_image(mesh_gt)
-                        img_arr = _to_uint8_image(img)
-                        if img_arr is not None:
-                            ground_truth.append(wandb.Image(img_arr, caption=f"GroundTruth idx={idx}"))
+        # WandBのロガーを通じて、予測と正解の画像を比較可能な形でダッシュボードへ送信
+        wandb_logger = trainer.logger
+        wandb_logger.experiment.log({"pyvista_predictions": images})
+        wandb_logger.experiment.log({"pyvista_ground_truth": ground_truth})
 
-            # log single images
-            wandb_logger = getattr(trainer, "logger", None)
-            if wandb_logger and hasattr(wandb_logger, "experiment"):
-                if images:
-                    wandb_logger.experiment.log({"pyvista_predictions": images})
-                if ground_truth:
-                    wandb_logger.experiment.log({"pyvista_ground_truth": ground_truth})
-        except Exception as e:
-            logger.error(f"Error in LogPyVistaPredictionsCallback.on_validation_epoch_end: {e}")
+        frames_predictions = []
+        frames_ground_truth = []
+        predicted_outputs = None
 
-        # If multiple indices form a temporal sequence, also create videos
+        # --- フェーズ 2: 連続フレームを用いた「時系列ロールアウト動画（シミュレーションアニメーション）」の生成 ---
         if len(self.indices) > 1:
-            try:
-                frames_predictions = []
-                frames_ground_truth = []
-                predicted_outputs = None
+            with torch.no_grad():
+                # 指定された最初のインデックスから最後のインデックスまでを時間軸としてループ
+                for idx in range(self.indices[0], self.indices[-1]):
+                    graph = self.dataset[idx].to(device)
 
-                with torch.no_grad():
-                    # iterate through a contiguous range (conservative)
-                    for idx in range(self.indices[0], self.indices[-1] + 1):
-                        sample = self.dataset[idx]
-                        if isinstance(sample, tuple) and len(sample) >= 1:
-                            graph = sample[0]
-                        else:
-                            graph = sample
-                        graph = graph.to(device)
+                    # 2ステップ目以降：前ステップでAIが予測した値を、次の入力特徴量フィールドへ動的に書き戻す（自律回帰の接続）
+                    if predicted_outputs is not None:
+                        graph.x[
+                            :,
+                            model.model.output_index_start : model.model.output_index_end,
+                        ] = predicted_outputs.detach()
 
-                        # carry-over from previous prediction if model expects recurrent usage
-                        if predicted_outputs is not None:
-                            out_slice_start = pl_module.model.output_index_start if hasattr(pl_module, "model") else 0
-                            out_slice_end = pl_module.model.output_index_end if hasattr(pl_module, "model") else predicted_outputs.shape[1]
-                            try:
-                                graph.x[:, out_slice_start:out_slice_end] = predicted_outputs.detach()
-                            except Exception:
-                                pass
+                    # 壁面や流入条件などの不変境界のインデックスを特定するためのマスクを作成
+                    mask = build_mask(model.param, graph)
+                    target = graph.y # 次のステップの正解物理量
 
-                        mask = build_mask(pl_module.param if hasattr(pl_module, "param") else {}, graph)
-                        _, _, predicted_outputs = pl_module(graph)
-                        if predicted_outputs is None:
-                            continue
+                    # 1ステップ先を予測
+                    _, _, predicted_outputs = self._forward_with_autocast_if_needed(
+                        model, graph
+                    )
+                    
+                    # 誤差累積の防波堤：壁面等の境界条件ノードの予測値を、正解の値（流速0など）に強制リセット・固定
+                    predicted_outputs[mask] = target[mask]
 
-                        # enforce masked ground-truth where mask True
-                        try:
-                            target = graph.y
-                            predicted_outputs[mask] = target[mask]
-                        except Exception:
-                            pass
+                    graph.x = predicted_outputs
+                    
+                    feature_names = model.param.get("dataset", {}).get("feature_names", None)
 
-                        # prediction frame
-                        gvis = graph.clone()
-                        gvis.x = predicted_outputs
-                        mesh_pred = convert_to_pyvista_mesh(gvis)
-                        img = self._generate_pyvista_image(mesh_pred)
-                        arr = _to_uint8_image(img)
-                        if arr is not None:
-                            frames_predictions.append(arr)
+                    # 予測メッシュの3D変換とレンダリング画像配列の取得
+                    predicted_mesh = self._convert_to_pyvista_mesh(graph, feature_names)
+                    img = self._generate_pyvista_image(predicted_mesh, feature_names)
+                    
+                    # 動画配列表信用に NumPy型 (uint8: 0~255) に変換してリストへストック
+                    img_array = np.array(img).astype(np.uint8)
+                    frames_predictions.append(img_array)
 
-                        # ground-truth frame
-                        gvis_gt = graph.clone()
-                        if hasattr(gvis_gt, "y") and gvis_gt.y is not None:
-                            gvis_gt.x = gvis_gt.y
-                            mesh_gt = convert_to_pyvista_mesh(gvis_gt)
-                            img = self._generate_pyvista_image(mesh_gt)
-                            arr = _to_uint8_image(img)
-                            if arr is not None:
-                                frames_ground_truth.append(arr)
+                    # --- 正解データ（Ground Truth）側のアニメーションフレームも同様に作成 ---
+                    graph.x = graph.y
+                    ground_truth_mesh = self._convert_to_pyvista_mesh(graph, feature_names)
 
-                if frames_predictions:
-                    # frames: (T, H, W, C) -> WandB wants (T, C, H, W)
-                    vid_pred = np.stack(frames_predictions, axis=0)
-                    vid_gt = np.stack(frames_ground_truth, axis=0) if frames_ground_truth else None
+                    img = self._generate_pyvista_image(ground_truth_mesh, feature_names)
+                    img_array = np.array(img).astype(np.uint8)
+                    frames_ground_truth.append(img_array)
 
-                    vid_pred = np.transpose(vid_pred, (0, 3, 1, 2))
-                    if vid_gt is not None:
-                        vid_gt = np.transpose(vid_gt, (0, 3, 1, 2))
+            # 収集した全フレームの画像を時間軸方向にスタックして4次元テンソルを形成
+            # 形状: (時間ステップ数, 高さ, 幅, チャンネルRGB)
+            frames_predictions = np.stack(frames_predictions, axis=0)  
+            frames_ground_truth = np.stack(frames_ground_truth, axis=0)
 
-                    if wandb_logger and hasattr(wandb_logger, "experiment"):
-                        wandb_logger.experiment.log({"pyvista_predictions_video": wandb.Video(vid_pred, fps=4)})
-                        if vid_gt is not None:
-                            wandb_logger.experiment.log({"pyvista_ground_truth_video": wandb.Video(vid_gt, fps=4)})
-            except Exception as e:
-                logger.error(f"Error while creating PyVista videos: {e}")
+            # WandB Videoオブジェクトが要求するテンソル規格 (時間, チャンネル, 高さ, 幅) へ軸を入れ替え
+            frames_predictions = np.transpose(frames_predictions, (0, 3, 1, 2))
+            frames_ground_truth = np.transpose(frames_ground_truth, (0, 3, 1, 2))
 
-    def _generate_pyvista_image(self, mesh) -> Optional[np.ndarray]:
-        """PyVista でスクリーンショットを取得して numpy 配列で返す。headless なら None."""
-        if _is_headless():
-            return None
-        try:
-            if pv is None:
-                logger.debug("pyvista not available: skipping render")
-                return None
-            p = pv.Plotter(off_screen=True)
-            p.add_mesh(mesh, scalars=next(iter(mesh.point_data.keys())) if mesh.point_data else None, opacity=0.8)
-            p.add_legend()
-            img = p.screenshot(return_img=True)
-            p.close()
-            return img
-        except Exception as e:
-            logger.error(f"PyVista render failed: {e}")
-            try:
-                p.close()
-            except Exception:
-                pass
-            return None
+            # 秒間4フレーム (fps=4) の流体アニメーション動画オブジェクトを構築
+            video_predictions = wandb.Video(frames_predictions, fps=4)
+            video_ground_truth = wandb.Video(frames_ground_truth, fps=4)
+
+            # WandBへ予測シミュレーション動画と正解シミュレーション動画をアップロード
+            wandb_logger = trainer.logger
+            wandb_logger.experiment.log(
+                {"pyvista_predictions_video": video_predictions}
+            )
+            wandb_logger.experiment.log(
+                {"pyvista_ground_truth_video": video_ground_truth}
+            )
+
+    def _convert_to_pyvista_mesh(self, graph: Data, feature_names: List[str] = None) -> pv.PolyData:
+        """
+        PyTorch Geometric の Data 構造（テンソル）から、PyVistaの 3D多角形メッシュデータ構造（PolyData）へ変換する。
+        """
+        # 外部のユーティリティ関数を使って基本幾何トポロジーを変換
+        mesh = convert_to_pyvista_mesh(graph=graph, add_all_data=True, feature_names=feature_names)
+
+        return mesh
+
+    def _generate_pyvista_image(self, predicted_mesh: pv.PolyData, feature_names: List[str] = None):
+        """
+        PyVistaのプロッターを起動し、メッシュ上に割り当てられた物理量のスカラー場（"x0"）を
+        カラーコンター図（色付き分布図）としてレンダリングし、画像配列を抽出して返す。
+        """
+        # クラスタやサーバー上（画面を持たない環境）でもレンダリングできるよう off_screen=True を設定
+        plotter = pv.Plotter(off_screen=True)
+        
+        # 描画対象の変数を決定（Velocity_Magnitudeが存在すれば優先、無ければ最初の特徴量）
+        target_scalar = "Velocity_Magnitude" if "Velocity_Magnitude" in predicted_mesh.point_data else (feature_names[0] if feature_names else "x0")
+
+        # 3D空間に色付きメッシュを追加。不透明度を0.8に設定してわずかに透過させる
+        plotter.add_mesh(predicted_mesh, scalars=target_scalar, label=target_scalar, opacity=0.8)
+        plotter.add_legend() # カラーバーや凡例の配置
+        
+        # レンダリング結果をスクリーンショット（画像配列）として取得
+        img = plotter.screenshot(return_img=True)
+        plotter.close() # メモリリークを防ぐため、プロッターのコンテキストを確実にシャットダウン
+        return img

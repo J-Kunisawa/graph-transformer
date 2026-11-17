@@ -11,9 +11,13 @@ from graphphysics.utils.torch_graph import meshdata_to_graph
 def read_h5_metadata(
     dataset_path: str, meta_path: str
 ) -> Tuple[List[str], int, Dict[str, Any]]:
-    """Reads trajectory indices and metadata without keeping the file open."""
+    """
+    HDF5ファイルハンドルを開きっぱなしにせず、安全にクローズした状態で
+    データセット（軌跡キー名一覧）とJSONメタデータを一括で読み込む。
+    """
+    # with構文のブロックを抜けると、h5ファイルハンドルは自動的にクローズされる
     with h5py.File(dataset_path, "r") as file_handle:
-        datasets_index = list(file_handle.keys())
+        datasets_index = list(file_handle.keys()) # 軌跡の名前（例: 'sample_000001' 等）のリストを取得
 
     with open(meta_path, "r") as fp:
         meta = json.load(fp)
@@ -25,8 +29,8 @@ def get_h5_dataset(
     dataset_path: str, meta_path: str
 ) -> Tuple[h5py.File, List[str], int, Dict[str, Any]]:
     """
-    Open an HDF5 file and return (file_handle, datasets_index, n_datasets, meta).
-    Caller is responsible for closing the returned file handle.
+    H5ファイルを開き、データセットのインデックスおよびハンドル、JSONメタデータを取得して返す。
+    ※この関数ではハンドルを開いたまま返すため、利用側で明示的なクローズや管理が必要。
     """
     file_handle = h5py.File(dataset_path, "r")
     datasets_index = list(file_handle.keys())
@@ -39,28 +43,21 @@ def get_traj_as_meshes(
     file_handle: h5py.File, traj_number: str, meta: Dict[str, Any]
 ) -> Dict[str, np.ndarray]:
     """
-    Load all feature arrays for a given trajectory into a dict of numpy arrays.
-
-    Each feature is converted to the dtype specified in meta["features"][name]["dtype"]
-    and reshaped according to meta["features"][name]["shape"].
-    Missing features raise a KeyError.
+    特定の軌跡（シミュレーションケース全体）のデータをH5ファイルから一括ロードする。
+    
+    JSONメタデータで事前に定義された物理フィールドのデータ型（dtype）および形状（shape）に従って、
+    ディスク上のバイナリを正確なテンソル構造へとリスト・辞書化して展開する。
     """
-    if traj_number not in file_handle:
-        raise KeyError(f"Trajectory '{traj_number}' not found in HDF5 file")
+    features = file_handle[traj_number] # 指定された軌跡グループにアクセス
+    meshes = {}
 
-    features_group = file_handle[traj_number]
-    meshes: Dict[str, np.ndarray] = {}
-
-    for key, spec in meta.get("features", {}).items():
-        if key not in features_group:
-            raise KeyError(f"Feature '{key}' not found in trajectory '{traj_number}'")
-        arr = features_group[key][()]
-        arr = np.asarray(arr).astype(spec["dtype"], copy=False)
-        # reshape if a shape is provided
-        shape = spec.get("shape", None)
-        if shape is not None:
-            arr = arr.reshape(shape)
-        meshes[key] = arr
+    # メタデータの宣言に基づいてループを回し、特徴量を展開
+    for key, field in meta["features"].items():
+        # features[key][()] によって、HDF5データセットの生の全フレーム配列をNumPy配列として一括メモリロード
+        data = features[key][()].astype(field["dtype"])
+        # [総フレーム数, ノード数, 物理次元] 等の正しい多次元形状へと整形
+        data = data.reshape(field["shape"])
+        meshes[key] = data
 
     return meshes
 
@@ -68,64 +65,47 @@ def get_traj_as_meshes(
 def get_frame_as_mesh(
     traj: Dict[str, np.ndarray],
     frame: int,
-    targets: Optional[List[str]] = None,
+    targets: list[str] = None,
     frame_target: Optional[int] = None,
 ) -> Tuple[
-    np.ndarray,
-    np.ndarray,
-    Dict[str, np.ndarray],
-    Optional[Dict[str, np.ndarray]],
-    Optional[Dict[str, np.ndarray]],
+    np.ndarray, np.ndarray, Dict[str, np.ndarray], Optional[Dict[str, np.ndarray]]
 ]:
     """
-    Extract mesh_pos, cells, point_data (for `frame`), optional target_point_data (for frame_target),
-    and optional next_data (other dynamic fields from frame_target).
-
-    Returns a 5-tuple:
-      (mesh_pos, cells, point_data, target_point_data, next_data)
-    target_point_data and next_data are None when frame_target is None.
+    ロード済みの軌跡（traj辞書）から、指定された特定の『フレーム（時刻 t）』のメッシュデータをスライス抽出する。
+    
+    もし訓練中などで `frame_target`（時刻 t+1）が指定されている場合は、
+    未来のターゲット物理量（教師ラベル）と、時間変化する動的フィールドの次ステップ値も同時に切り出して仕分ける。
     """
-    if targets is None:
-        targets = []
+    target_point_data = None
+    next_data = None
 
-    # mesh positions and cells: handle (T, N, D) or (N, D) shapes
-    mesh_pos_arr = traj.get("mesh_pos")
-    if mesh_pos_arr is None:
-        raise KeyError("mesh_pos missing in trajectory data")
-    mesh_pos = mesh_pos_arr[frame] if getattr(mesh_pos_arr, "ndim", 0) > 1 else mesh_pos_arr
-
-    cells_arr = traj.get("cells")
-    if cells_arr is None:
-        raise KeyError("cells missing in trajectory data")
-    cells = cells_arr[frame] if getattr(cells_arr, "ndim", 0) > 1 else cells_arr
-
-    # collect point-wise features for the frame (exclude mesh_pos, cells, node_type)
-    point_data: Dict[str, np.ndarray] = {}
-    for key, val in traj.items():
-        if key in ("mesh_pos", "cells", "node_type"):
-            continue
-        # if per-frame array, index it; else take it as-is
-        point_data[key] = val[frame] if getattr(val, "ndim", 0) > 1 else val
-
-    # node_type: often stored as shape (1, N) or (N,)
-    node_type_arr = traj.get("node_type")
-    if node_type_arr is None:
-        raise KeyError("node_type missing in trajectory data")
-    node_type = node_type_arr[0] if getattr(node_type_arr, "ndim", 0) > 1 else node_type_arr
-    point_data["node_type"] = node_type
-
-    target_point_data: Optional[Dict[str, np.ndarray]] = None
-    next_data: Optional[Dict[str, np.ndarray]] = None
+    # 未来のターゲットステップ（t+1）の抽出ロジック
     if frame_target is not None:
-        target_point_data = {}
-        next_data = {}
-        for key, val in traj.items():
-            if key in ("mesh_pos", "cells", "node_type"):
-                continue
-            if key in targets:
-                target_point_data[key] = val[frame_target] if getattr(val, "ndim", 0) > 1 else val
-            else:
-                next_data[key] = val[frame_target] if getattr(val, "ndim", 0) > 1 else val
+        # モデルが直接予測すべき物理ターゲット（例: velocity）をスライス
+        target_point_data = {key: traj[key][frame_target] for key in targets}
+        
+        # 予測対象（targets）ではないが、時間変化する動的特徴量（可動障害物の次ステップ座標など）の仕分け
+        next_data = {
+            key: traj[key][frame_target]
+            for key in traj.keys()
+            if key not in ["mesh_pos", "cells", "node_type"] and key not in targets
+        }
+
+    # 現時刻（t）の物理量（流速、圧力など）をまとめて辞書として切り出し
+    point_data = {
+        key: traj[key][frame]
+        for key in traj.keys()
+        if key not in ["mesh_pos", "cells", "node_type"]
+    }
+    # 境界条件を示すノード属性(node_type)は、時間不変であるため、最初のフレームのトポロジーで固定
+    point_data["node_type"] = traj["node_type"][0]
+
+    # ノードのデカルト座標(mesh_pos)および要素の接続情報(cells)を取得
+    # メッシュ自体が時間変化して変形するタイプ(ndim > 1)か、静的格子（ndim <= 1）かでスライスを分岐
+    mesh_pos = (
+        traj["mesh_pos"][frame] if traj["mesh_pos"].ndim > 1 else traj["mesh_pos"]
+    )
+    cells = traj["cells"][frame] if traj["cells"].ndim > 1 else traj["cells"]
 
     return mesh_pos, cells, point_data, target_point_data, next_data
 
@@ -134,14 +114,23 @@ def get_frame_as_graph(
     traj: Dict[str, np.ndarray],
     frame: int,
     meta: Dict[str, Any],
-    targets: Optional[List[str]] = None,
+    targets: list[str] = None,
     frame_target: Optional[int] = None,
 ) -> Data:
     """
-    Convert a single frame (and optional target frame) from trajectory dict into a PyG Data graph.
+    指定フレームのメッシュ配列（NumPy）を、PyTorch Geometricが要求する
+    完全なグラフ表現オブジェクト（Data）へとコンバートする統合パイプライン関数。
     """
-    points, cells, point_data, target, next_data = get_frame_as_mesh(traj, frame, targets, frame_target)
-    time = float(frame) * float(meta.get("dt", 1))
+    # 1. NumPy配列形式としてメッシュ構成データをピンポイントで切り出し
+    points, cells, point_data, target, next_data = get_frame_as_mesh(
+        traj, frame, targets, frame_target
+    )
+    
+    # シミュレーション上の物理的な経過時間（time = ステップ数 × dt）を計算
+    time = frame * meta.get("dt", 1)
+    
+    # 2. torch_graph.py の変換モジュールへ丸投げし、
+    # ノード、エッジインデックス、デカルト座標、教師ラベルを内包した Data オブジェクトを新調して返す
     return meshdata_to_graph(
         points=points,
         cells=cells,
@@ -149,5 +138,4 @@ def get_frame_as_graph(
         time=time,
         target=target,
         next_data=next_data,
-        meta=meta,
     )
