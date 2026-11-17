@@ -1,0 +1,83 @@
+{
+  "model": {
+    "type": "transolver",
+    "message_passing_num": 10,
+    "node_input_size": 3,               
+    "edge_input_size": 0,
+    "edge_feature": false,
+    "output_size": 3,                  
+    "hidden_size": 64,
+    "num_heads": 2,
+    "use_previous_data": false,
+    "dropout_rate": 0.1,
+    "use_silu_activation": false,
+    "mlp_ratio": 1,
+    "slice_num": 32,
+    "ref": 8,
+    "unified_pos": false,
+    "use_rope_embeddings": false,
+    "use_gated_attention": false
+  },
+
+  "index": {
+    "feature_index_start": 0,
+    "feature_index_end": 3,            
+    "output_index_start": 0,
+    "output_index_end": 3,             
+    "node_type_index": 3               
+  },
+
+  "dataset": {
+    "extension": "h5",
+    "train_path": "/mnt/graph-physics/data/cylinder/train.h5",
+    "valid_path": "/mnt/graph-physics/data/cylinder/valid.h5",
+    "test_path": "/mnt/graph-physics/data/cylinder/test.h5",
+    "meta_path": "/mnt/graph-physics/dataset_config/cylinder_meta.json",
+    "targets": ["velocity", "pressure"],
+    "khop": 1
+  },
+
+  "transformations": {
+    "preprocessing": {
+        "noise": [0.02],
+        "noise_index_start": [0],
+        "noise_index_end": [3]
+    }
+  },
+
+  "trainer": {
+    "accelerator": "auto",
+    "devices": 1,
+    "gradient_clip_val": 1.0
+  },
+
+  "training": {
+    "multi_step_loss": true,
+    "multi_step_loss_steps": 5,
+    "multi_step_loss_weight": 0.5
+  },
+  
+   "loss": {
+    "type": ["L2Loss"]
+  },
+
+  "optimizer": {
+    "type": "adamw",
+    "lr": 1e-4,
+    "weight_decay": 0.01,
+    "betas": [0.9, 0.95]
+  },
+
+  "early_stopping": {
+    "monitor": "val_all_rollout_rmse",
+    "patience": 20,
+    "mode": "min",
+    "min_delta": 1e-4
+  },
+
+  "checkpoint": {
+    "monitor": "val_all_rollout_rmse",
+    "mode": "min",
+    "save_top_k": 3
+  }
+}

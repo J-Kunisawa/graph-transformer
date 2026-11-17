@@ -1,0 +1,58 @@
+{
+  "dt": 0.01,
+  "features": {
+    "cells": {
+      "type": "static",
+      "shape": [
+        601,
+        -1,
+        3
+      ],
+      "dtype": "int32"
+    },
+    "mesh_pos": {
+      "type": "static",
+      "shape": [
+        601,
+        -1,
+        2
+      ],
+      "dtype": "float32"
+    },
+    "node_type": {
+      "type": "static",
+      "shape": [
+        601,
+        -1,
+        1
+      ],
+      "dtype": "int32"
+    },
+    "U": {
+      "type": "dynamic",
+      "shape": [
+        601,
+        -1,
+        2
+      ],
+      "dtype": "float32"
+    },
+    "p": {
+      "type": "dynamic",
+      "shape": [
+        601,
+        -1,
+        1
+      ],
+      "dtype": "float32"
+    }
+  },
+  "field_names": [
+    "cells",
+    "mesh_pos",
+    "node_type",
+    "U",
+    "p"
+  ],
+  "trajectory_length": 601
+}

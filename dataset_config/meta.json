@@ -1,0 +1,42 @@
+{
+  "dt": 0.01,
+  "trajectory_length": 600,
+  "geometry": {
+    "obstacle_center": [
+      0.325,
+      0.2
+    ],
+    "obstacle_diameter": 0.1
+  },
+  "field_names": [
+    "velocity",
+    "pressure",
+    "node_type"
+  ],
+  "features": {
+    "velocity": {
+      "type": "dynamic",
+      "shape": [
+        -1,
+        2
+      ],
+      "dtype": "float32"
+    },
+    "pressure": {
+      "type": "dynamic",
+      "shape": [
+        -1,
+        1
+      ],
+      "dtype": "float32"
+    },
+    "node_type": {
+      "type": "static",
+      "shape": [
+        -1,
+        1
+      ],
+      "dtype": "int32"
+    }
+  }
+}

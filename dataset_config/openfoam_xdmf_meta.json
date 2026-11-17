@@ -1,0 +1,16 @@
+{
+  "dt": 0.01,
+  "trajectory_length": 600,
+  "features": {
+    "U": {
+      "type": "dynamic",
+      "shape": [-1, 2],
+      "dtype": "float32"
+    },
+    "p": {
+      "type": "dynamic",
+      "shape": [-1, 1],
+      "dtype": "float32"
+    }
+  }
+}

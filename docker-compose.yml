@@ -1,0 +1,23 @@
+services:
+  graph-physics:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: graph-physics:latest
+    container_name: graph_physics
+    volumes:
+      - .:/workspace
+      - /workspace/.venv/
+      - /workspace/__pycache__/
+    shm_size: '16gb'
+    environment:
+      - DGLBACKEND=pytorch
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    stdin_open: true
+    tty: true

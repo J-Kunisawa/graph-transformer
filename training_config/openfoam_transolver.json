@@ -1,0 +1,86 @@
+{
+  "model": {
+    "type": "transolver",
+    "message_passing_num": 5,
+    "node_input_size": 3,               
+    "edge_input_size": 0,
+    "edge_feature": false,
+    "output_size": 3,                  
+    "hidden_size": 64,
+    "num_heads": 2,
+    "use_previous_data": false,
+    "dropout_rate": 0.1,
+    "use_silu_activation": false,
+    "mlp_ratio": 1,
+    "slice_num": 32,
+    "ref": 8,
+    "unified_pos": false,
+    "use_rope_embeddings": false,
+    "use_gated_attention": false
+  },
+
+  "index": {
+    "feature_index_start": 0,
+    "feature_index_end": 3,            
+    "output_index_start": 0,
+    "output_index_end": 3,             
+    "node_type_index": 3               
+  },
+
+  "dataset": {
+    "extension": "h5",
+    "train_path": "data/cylinder_made/ver4/train_re_50-300/train.h5",
+    "valid_path": "data/cylinder_made/ver4/train_re_50-300/valid.h5",
+    "test_path": "data/cylinder_made/ver4/test_re60-200/test.h5",
+    "meta_path": "data/cylinder_made/ver4/train_re_50-300/train_meta.json",
+    "targets": ["U", "p"],
+    "khop": 1,
+    "new_edges_ratio": 0
+  },
+
+  "transformations": {
+    "preprocessing": {
+        "noise": [0.02],
+        "noise_index_start": [0],
+        "noise_index_end": [3]
+    }
+  },
+
+  "trainer": {
+    "accelerator": "auto",
+    "devices": 1,
+    "gradient_clip_val": 1.0
+  },
+
+  "training": {
+    "use_temporal_block": false,
+    "multi_step_loss": false,
+    "multi_step_loss_steps": 5,
+    "multi_step_loss_weight": 0.5
+  },
+
+  "loss": {
+    "type": ["L2Loss"]
+  },
+
+  "optimizer": {
+    "type": "adamw",
+    "lr": 0.001,
+    "weight_decay": 0.01,
+    "betas": [0.9, 0.95],
+    "min_lr_factor": 0.01
+  },
+
+  "early_stopping": {
+    "monitor": "val_loss",
+    "patience": 30,
+    "mode": "min",
+    "min_delta": 1e-5
+  },
+
+  "checkpoint": {
+    "monitor": "val_loss",
+    "mode": "min",
+    "save_top_k": 1
+  }
+}
