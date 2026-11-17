@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Training outputs
+checkpoints/
+logs/
+predictions/
+output_vis/
+wandb/
+
+# Data (datasets are not tracked in this repository)
+data/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Secrets / local config
+.env
